@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/xgadget-lab/nexttrace/trace"
+	"github.com/nxtrace/NTrace-core/trace"
 
-	"github.com/xgadget-lab/nexttrace/ipgeo"
+	"github.com/nxtrace/NTrace-core/ipgeo"
 )
 
 // var dataOrigin string
@@ -19,6 +19,8 @@ import (
 // 		}
 // 	}
 // }
+
+//此文件目前仅供classic_printer使用
 
 const (
 	RED_PREFIX    = "\033[1;31m"
@@ -33,6 +35,7 @@ func HopPrinter(h trace.Hop, info HopInfo) {
 	if h.Address == nil {
 		fmt.Println("\t*")
 	} else {
+		applyLangSetting(&h) // 应用语言设置
 		txt := "\t"
 
 		if h.Hostname == "" {
@@ -43,6 +46,9 @@ func HopPrinter(h trace.Hop, info HopInfo) {
 
 		if h.Geo != nil {
 			txt += " " + formatIpGeoData(h.Address.String(), h.Geo)
+		}
+		for _, v := range h.MPLS {
+			txt += " " + v
 		}
 		switch info {
 		case IXP:

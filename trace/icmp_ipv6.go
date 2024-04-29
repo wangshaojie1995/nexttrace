@@ -1,6 +1,7 @@
 package trace
 
 import (
+	"bytes"
 	"encoding/binary"
 	"log"
 	"net"
@@ -12,6 +13,8 @@ import (
 	"golang.org/x/net/context"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv6"
+
+	"github.com/nxtrace/NTrace-core/trace/internal"
 )
 
 type ICMPTracerv6 struct {
@@ -25,10 +28,11 @@ type ICMPTracerv6 struct {
 	icmpListen            net.PacketConn
 	final                 int
 	finalLock             sync.Mutex
+	fetchLock             sync.Mutex
 }
 
 func (t *ICMPTracerv6) PrintFunc() {
-	// defer t.wg.Done()
+	defer t.wg.Done()
 	var ttl = t.Config.BeginHop - 1
 	for {
 		if t.AsyncPrinter != nil {
@@ -42,12 +46,12 @@ func (t *ICMPTracerv6) PrintFunc() {
 					t.RealtimePrinter(&t.res, ttl)
 				}
 				ttl++
-				if ttl == t.final {
+
+				if ttl == t.final-1 || ttl >= t.MaxHops-1 {
 					return
 				}
 			}
 		}
-
 		<-time.After(200 * time.Millisecond)
 	}
 }
@@ -63,7 +67,7 @@ func (t *ICMPTracerv6) Execute() (*Result, error) {
 
 	var err error
 
-	t.icmpListen, err = net.ListenPacket("ip6:58", t.SrcAddr)
+	t.icmpListen, err = internal.ListenICMP("ip6:58", t.SrcAddr)
 	if err != nil {
 		return &t.res, err
 	}
@@ -76,6 +80,7 @@ func (t *ICMPTracerv6) Execute() (*Result, error) {
 	t.final = -1
 
 	go t.listenICMP()
+	t.wg.Add(1)
 	go t.PrintFunc()
 	for ttl := t.BeginHop; ttl <= t.MaxHops; ttl++ {
 		t.inflightRequestRWLock.Lock()
@@ -135,6 +140,7 @@ func (t *ICMPTracerv6) Execute() (*Result, error) {
 
 func (t *ICMPTracerv6) listenICMP() {
 	lc := NewPacketListener(t.icmpListen, t.ctx)
+	psize = t.Config.PktSize
 	go lc.Start()
 	for {
 		select {
@@ -165,8 +171,9 @@ func (t *ICMPTracerv6) listenICMP() {
 				}
 
 			}
+			ttl := int64(binary.BigEndian.Uint16(msg.Msg[54:56]))
 			packet_id := strconv.FormatInt(int64(binary.BigEndian.Uint16(msg.Msg[52:54])), 2)
-			if process_id, ttl, err := reverseID(packet_id); err == nil {
+			if process_id, _, err := reverseID(packet_id); err == nil {
 				if process_id == int64(os.Getpid()&0x7f) {
 					dstip := net.IP(msg.Msg[32:48])
 					// 无效包本地环回包
@@ -186,6 +193,8 @@ func (t *ICMPTracerv6) listenICMP() {
 							t.handleICMPMessage(msg, 0, rm.Body.(*icmp.TimeExceeded).Data, int(ttl))
 						case ipv6.ICMPTypeEchoReply:
 							t.handleICMPMessage(msg, 1, rm.Body.(*icmp.Echo).Data, int(ttl))
+						case ipv6.ICMPTypeDestinationUnreachable:
+							t.handleICMPMessage(msg, 2, rm.Body.(*icmp.DstUnreach).Data, int(ttl))
 						default:
 							// log.Println("received icmp message of unknown type", rm.Type)
 						}
@@ -229,12 +238,20 @@ func (t *ICMPTracerv6) listenICMP() {
 }
 
 func (t *ICMPTracerv6) handleICMPMessage(msg ReceivedMessage, icmpType int8, data []byte, ttl int) {
+	if icmpType == 2 {
+		if t.DestIP.String() != msg.Peer.String() {
+			return
+		}
+	}
 	t.inflightRequestRWLock.RLock()
 	defer t.inflightRequestRWLock.RUnlock()
+
+	mpls := extractMPLS(msg, data)
 	if _, ok := t.inflightRequest[ttl]; ok {
 		t.inflightRequest[ttl] <- Hop{
 			Success: true,
 			Address: msg.Peer,
+			MPLS:    mpls,
 		}
 	}
 }
@@ -244,13 +261,20 @@ func (t *ICMPTracerv6) send(ttl int) error {
 	if t.final != -1 && ttl > t.final {
 		return nil
 	}
-	id := gernerateID(ttl)
+	//id := gernerateID(ttl)
+	id := gernerateID(0)
+
+	//data := []byte{byte(ttl)}
+	data := []byte{byte(0)}
+	data = append(data, bytes.Repeat([]byte{1}, t.Config.PktSize-5)...)
+	data = append(data, 0x00, 0x00, 0x4f, 0xff)
 
 	icmpHeader := icmp.Message{
 		Type: ipv6.ICMPTypeEchoRequest, Code: 0,
 		Body: &icmp.Echo{
-			ID:   id,
-			Data: []byte("HELLO-R-U-THERE"),
+			ID: id,
+			//Data: []byte("HELLO-R-U-THERE"),
+			Data: data,
 			Seq:  ttl,
 		},
 	}
@@ -298,6 +322,8 @@ func (t *ICMPTracerv6) send(ttl int) error {
 		h.TTL = ttl
 		h.RTT = rtt
 
+		t.fetchLock.Lock()
+		defer t.fetchLock.Unlock()
 		h.fetchIPData(t.Config)
 
 		t.res.add(h)
